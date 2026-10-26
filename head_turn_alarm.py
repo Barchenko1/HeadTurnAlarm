@@ -41,7 +41,7 @@ if sys.platform.startswith("linux"):
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QLabel, QMainWindow,
+from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QMainWindow,
                                QSpinBox, QToolBar, QWidget)
 
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -55,7 +55,7 @@ LOST_FACE_SECONDS = 15.0   # keep alarming this long if the face vanished while 
 BEEP_EVERY_SECONDS = 1.0
 GAUGE_RANGE_DEG = 60.0
 OPACITIES = [round(0.1 * i, 1) for i in range(1, 11)]
-MAX_ZOOM = 3.0
+ZOOMS = [1.0, 1.5, 2.0, 3.0]
 
 GREEN, ORANGE, RED = "#50c850", "#ffa500", "#e62828"
 YELLOW, GRAY, WHITE = "#f0dc00", "#aaaaaa", "#ffffff"
@@ -75,8 +75,12 @@ def parse_args():
     p.add_argument("--opacity", type=float, default=0.5,
                    help="camera picture opacity from 0.1 (almost see-through) to 1.0 (solid), "
                         "default 0.5")
+    p.add_argument("--width", type=int, default=480,
+                   help="starting window width in pixels (default 480); "
+                        "drag the window edges to resize it")
     args = p.parse_args()
     args.angle = min(60, max(2, args.angle))
+    args.width = min(1280, max(320, args.width))
     args.opacity = min(1.0, max(0.1, round(args.opacity, 1)))
     return args
 
@@ -162,22 +166,34 @@ def open_camera(index):
     return cap
 
 
+def own_x11_windows():
+    """Linux: (id, x, y, width, height) of this app's window on screen, from wmctrl."""
+    if not (sys.platform.startswith("linux") and shutil.which("wmctrl")):
+        return []
+    try:
+        listing = subprocess.run(["wmctrl", "-l", "-G", "-p"], capture_output=True,
+                                 text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    windows = []
+    for row in listing.splitlines():
+        parts = row.split(None, 8)  # id, desktop, pid, x, y, width, height, host, title
+        if len(parts) == 9 and parts[2] == str(os.getpid()) and parts[8] == WINDOW:
+            windows.append((parts[0], *map(int, parts[3:7])))
+    return windows
+
+
 def wmctrl_set(states, on):
     """Linux: add or remove window states ("above", "sticky" = all workspaces) of this
     app's window. Returns False when wmctrl is missing or the window isn't shown yet."""
-    if not (sys.platform.startswith("linux") and shutil.which("wmctrl")):
-        return False
+    windows = own_x11_windows()
     try:
-        listing = subprocess.run(["wmctrl", "-l", "-p"], capture_output=True,
-                                 text=True, timeout=2).stdout
-        ids = [parts[0] for parts in (row.split(None, 4) for row in listing.splitlines())
-               if len(parts) == 5 and parts[2] == str(os.getpid()) and parts[4] == WINDOW]
-        for window_id in ids:
-            subprocess.run(["wmctrl", "-i", "-r", window_id, "-b",
+        for window in windows:
+            subprocess.run(["wmctrl", "-i", "-r", window[0], "-b",
                             f"{'add' if on else 'remove'},{states}"], timeout=2)
-        return bool(ids)
     except (OSError, subprocess.SubprocessError):
         return False
+    return bool(windows)
 
 
 class FaceTracker:
@@ -278,7 +294,6 @@ class VideoView(QWidget):
         self.opacity, self.zoom, self.angle = opacity, 1.0, angle
         self.image = None
         self.status, self.color, self.rel, self.alarming = "Starting the camera...", GRAY, None, False
-        self.setMinimumSize(320, 240)
 
     def show_frame(self, frame, status, color, rel, alarming, angle):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -342,7 +357,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cap, self.tracker, self.alarm = cap, tracker, alarm
         self.monitor = HeadMonitor(args.angle, args.delay)
-        self.frame = None           # last mirrored camera picture, for Save image
         self.bad_frames = 0
 
         self.setWindowTitle(WINDOW)
@@ -352,13 +366,18 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.build_toolbar(args)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, not args.no_top)
-        self.resize(640, 480 + self.toolbar.sizeHint().height())
+        # Starts small with a 4:3 picture; drag the window edges to resize it.
+        hints = [bar.sizeHint() for bar in self.toolbars]
+        self.setMinimumSize(max(hint.width() for hint in hints),
+                            sum(hint.height() for hint in hints) + 150)
+        width = max(args.width, self.minimumWidth())
+        self.resize(width, width * 3 // 4 + self.layout_toolbars(width))
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(0)
 
-    def add_button(self, text, tip, slot, checked=None, shortcut=None):
+    def add_button(self, bar, text, tip, slot, checked=None, shortcut=None):
         action = QAction(text, self)
         action.setToolTip(tip)
         if shortcut:
@@ -369,19 +388,24 @@ class MainWindow(QMainWindow):
             action.setCheckable(True)
             action.setChecked(checked)
             action.toggled.connect(slot)
-        self.toolbar.addAction(action)
+        bar.addAction(action)
         return action
 
-    def build_toolbar(self, args):
-        bar = self.toolbar = QToolBar()
+    def new_toolbar(self):
+        bar = QToolBar()
         bar.setMovable(False)
         bar.setAutoFillBackground(True)  # solid, even when the picture is see-through
+        bar.setStyleSheet("QToolButton { padding: 2px 4px; }")  # compact, same text size
         self.addToolBar(bar)
+        return bar
 
-        self.add_button("Calibrate", "Look straight at the screen, then click (key c)",
+    def build_toolbar(self, args):
+        bar, bar2 = self.toolbars = [self.new_toolbar(), self.new_toolbar()]
+
+        self.add_button(bar, "Calibrate", "Look straight at the screen, then click (key c)",
                         self.monitor.calibrate)
         bar.addSeparator()
-        bar.addWidget(QLabel(" Angle "))
+        bar.addWidget(QLabel("Angle "))
         self.angle_box = QSpinBox()
         self.angle_box.setRange(2, 60)
         self.angle_box.setSuffix("°")
@@ -391,34 +415,56 @@ class MainWindow(QMainWindow):
         self.angle_box.valueChanged.connect(lambda value: setattr(self.monitor, "angle", value))
         bar.addWidget(self.angle_box)
         bar.addSeparator()
-        self.sound_action = self.add_button("Sound", "Beep on / off (key m)",
+        self.sound_action = self.add_button(bar, "Sound", "Beep on / off (key m)",
                                             lambda on: setattr(self.alarm, "enabled", on),
                                             checked=not args.mute)
-        self.top_action = self.add_button("On top", "Keep this window over other apps (key t)",
+        self.top_action = self.add_button(bar, "On top", "Keep this window over other apps (key t)",
                                           self.set_on_top, checked=not args.no_top)
-        bar.addSeparator()
-        bar.addWidget(QLabel(" Opacity "))
+
+        bar2.addWidget(QLabel("Opacity "))
         self.opacity_box = QComboBox()
         self.opacity_box.addItems([f"{value:.1f}" for value in OPACITIES])
         self.opacity_box.setCurrentIndex(OPACITIES.index(args.opacity))
         self.opacity_box.setToolTip("How see-through the camera picture is, 1.0 = solid (keys 1-9, 0)")
         self.opacity_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.opacity_box.currentIndexChanged.connect(self.set_opacity)
-        bar.addWidget(self.opacity_box)
-        bar.addSeparator()
-        self.add_button("Zoom in", "Zoom in (Ctrl +)", lambda: self.set_zoom(1.25),
-                        shortcut=QKeySequence.StandardKey.ZoomIn)
-        self.add_button("Zoom out", "Zoom out (Ctrl -)", lambda: self.set_zoom(1 / 1.25),
-                        shortcut=QKeySequence.StandardKey.ZoomOut)
-        self.add_button("Save image", "Save the current camera picture (Ctrl S)", self.save_image,
-                        shortcut=QKeySequence.StandardKey.Save)
+        bar2.addWidget(self.opacity_box)
+        bar2.addSeparator()
+        bar2.addWidget(QLabel("Zoom "))
+        self.zoom_box = QComboBox()
+        self.zoom_box.addItems([f"{value:g}x" for value in ZOOMS])
+        self.zoom_box.setToolTip("Make the picture bigger (Ctrl + and Ctrl -)")
+        self.zoom_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.zoom_box.currentIndexChanged.connect(self.set_zoom)
+        bar2.addWidget(self.zoom_box)
+        for keys, step in ((QKeySequence.StandardKey.ZoomIn, 1), (QKeySequence.StandardKey.ZoomOut, -1)):
+            action = QAction(self)
+            action.setShortcut(keys)
+            action.triggered.connect(lambda _=False, step=step: self.zoom_box.setCurrentIndex(
+                min(len(ZOOMS) - 1, max(0, self.zoom_box.currentIndex() + step))))
+            self.addAction(action)  # key only, no button
+
+    def layout_toolbars(self, width):
+        """One toolbar row when it fits the window width, else two. Returns their height."""
+        bar1, bar2 = self.toolbars
+        one_row = bar1.sizeHint().width() + bar2.sizeHint().width() + 8 <= width
+        if one_row and self.toolBarBreak(bar2):
+            self.removeToolBarBreak(bar2)
+        elif not one_row and not self.toolBarBreak(bar2):
+            self.insertToolBarBreak(bar2)
+        heights = [bar1.sizeHint().height(), bar2.sizeHint().height()]
+        return max(heights) if one_row else sum(heights)
+
+    def resizeEvent(self, event):
+        self.layout_toolbars(event.size().width())
+        super().resizeEvent(event)
 
     def set_opacity(self, index):
         self.view.opacity = OPACITIES[index]
         self.view.update()
 
-    def set_zoom(self, factor):
-        self.view.zoom = min(MAX_ZOOM, max(1.0, self.view.zoom * factor))
+    def set_zoom(self, index):
+        self.view.zoom = ZOOMS[index]
         self.view.update()
 
     def set_on_top(self, on):
@@ -438,22 +484,19 @@ class MainWindow(QMainWindow):
         frame = self.frameGeometry()
         frame.moveCenter(self.screen().availableGeometry().center())
         self.move(frame.topLeft())
+        QTimer.singleShot(300, self.fix_position)
 
-    def save_image(self):
-        if self.frame is None:
+    def fix_position(self):
+        """Linux: GNOME shifts X11 windows by its invisible border and title bar, which
+        Qt doesn't know about. Measure where the window really is and move it back once."""
+        windows = own_x11_windows()
+        if not windows:
             return
-        frame = self.frame.copy()  # the picture at the moment of the click
-        pictures = Path.home() / "Pictures"
-        folder = pictures if pictures.is_dir() else Path.home()
-        default = folder / time.strftime("head-turn-%Y%m%d-%H%M%S.png")
-        path, _ = QFileDialog.getSaveFileName(self, "Save image", str(default),
-                                              "Images (*.png *.jpg)")
-        if not path:
-            return
-        if Path(path).suffix.lower() not in (".png", ".jpg", ".jpeg"):
-            path += ".png"
-        if not cv2.imwrite(path, frame):
-            print(f"Could not save {path}")
+        _, x, y, _, _ = windows[0]
+        expected = self.geometry().topLeft()  # where Qt thinks the picture area is
+        dx, dy = x - expected.x(), y - expected.y()
+        if abs(dx) > 2 or abs(dy) > 2:
+            self.move(self.x() - dx, self.y() - dy)
 
     def keyPressEvent(self, event):
         key = event.text().lower()
@@ -489,8 +532,8 @@ class MainWindow(QMainWindow):
         status, color, rel, alarming = self.monitor.update(self.tracker.head_yaw(frame, now), now)
         if alarming:
             self.alarm.ring(now)
-        self.frame = cv2.flip(frame, 1)  # mirror, like a video call self-view
-        self.view.show_frame(self.frame, status, color, rel, alarming, self.monitor.angle)
+        mirrored = cv2.flip(frame, 1)  # like a video call self-view
+        self.view.show_frame(mirrored, status, color, rel, alarming, self.monitor.angle)
 
     def closeEvent(self, event):
         self.timer.stop()

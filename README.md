@@ -20,13 +20,14 @@ On macOS, allow camera access for your terminal app when asked.
    and shows "Saved as your straight position".
 2. If you turn your head more than 5 degrees for more than 1 second, the window
    gets a red frame and it beeps until you turn back.
-3. The window opens in the middle of the screen and stays on top of other apps
-   (on Linux also on every workspace), so you can see it while you work.
+3. The window starts small (480 wide) in the middle of the screen. Drag an edge or a corner
+   to make it any size you like. It stays on top of other apps (on Linux also on every
+   workspace), so you can see it while you work.
 4. The camera picture is half see-through (opacity 0.5), the toolbar stays solid.
    Change it with **Opacity** in the toolbar (0.1 ... 1.0, 1.0 = solid).
 
 The toolbar has every control: **Calibrate**, **Angle**, **Sound**, **On top**,
-**Opacity**, **Zoom in**, **Zoom out** and **Save image**. Hover over a button to see its key.
+**Opacity** and **Zoom**. Hover over a control to see its key.
 
 How it knows "straight": it doesn't know where your camera is. It finds your face,
 measures which way your head points (it follows your nose and face shape, not your
@@ -43,7 +44,6 @@ Keys (click the window first):
 | `t`     | keep the window on top of other apps on / off |
 | `1`-`9` | opacity 0.1 - 0.9 (`0` = 1.0, solid)          |
 | Ctrl `+` `-` | zoom in / out (Cmd on macOS)             |
-| Ctrl `S` | save the camera picture (Cmd on macOS)       |
 | `q`     | quit                                          |
 
 Options:
@@ -58,6 +58,7 @@ Options:
 - `--mute` start without sound
 - `--no-top` don't keep the window on top of other apps
 - `--opacity 0.8` start with another opacity (0.1 - 1.0, default 0.5)
+- `--width 640` start with a bigger window (default 480)
 
 ## Notes
 
