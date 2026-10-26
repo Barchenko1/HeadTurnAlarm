@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if ! .venv/bin/python -c "import mediapipe" 2>/dev/null; then
+if ! .venv/bin/python -c "import mediapipe, PySide6" 2>/dev/null; then
   echo "First run: installing (takes a minute or two)..."
   if ! python3 -m venv .venv; then
     echo "Could not create a Python environment."
@@ -12,7 +12,7 @@ if ! .venv/bin/python -c "import mediapipe" 2>/dev/null; then
     exit 1
   fi
   .venv/bin/pip install --quiet --upgrade pip
-  .venv/bin/pip install --quiet mediapipe
+  .venv/bin/pip install --quiet mediapipe PySide6-Essentials
 fi
 
 exec .venv/bin/python head_turn_alarm.py "$@"

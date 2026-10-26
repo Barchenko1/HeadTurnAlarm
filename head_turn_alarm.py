@@ -4,20 +4,20 @@
 Shows you your webcam picture (mirrored, like in a video call) and sounds an
 alarm when your head stays turned to the left or right.
 
-Keys (click on the video window first):
+All controls are in the toolbar. Keys (click on the window first):
   c        calibrate: look straight at the screen and press c
   + / -    alarm angle up / down (less / more sensitive)
   m        sound on / off
   t        keep the window on top of other apps on / off
-  1 ... 9  window opacity 0.1 ... 0.9 (0 = 1.0, solid); or click the buttons
+  1 ... 9  picture opacity 0.1 ... 0.9 (0 = 1.0, solid)
   q, Esc   quit
 """
 
 import argparse
 import math
 import os
-import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -32,6 +32,18 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions, vision
 
+# OpenCV points Qt to its own Qt 5 plugins and fonts; this window uses Qt 6.
+for name in ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR"):
+    os.environ.pop(name, None)
+if sys.platform.startswith("linux"):
+    # On Wayland apps can't stay on top or place their window; through X11 (XWayland) they can.
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QLabel, QMainWindow,
+                               QSpinBox, QToolBar, QWidget)
+
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
              "face_landmarker/float16/1/face_landmarker.task")
 CACHE_DIR = Path.home() / ".cache" / "head-turn-alarm"
@@ -43,16 +55,15 @@ LOST_FACE_SECONDS = 15.0   # keep alarming this long if the face vanished while 
 BEEP_EVERY_SECONDS = 1.0
 GAUGE_RANGE_DEG = 60.0
 OPACITIES = [round(0.1 * i, 1) for i in range(1, 11)]
+MAX_ZOOM = 3.0
 
-GREEN, ORANGE, RED = (80, 200, 80), (0, 165, 255), (40, 40, 230)
-YELLOW, GRAY, WHITE = (0, 220, 240), (170, 170, 170), (255, 255, 255)
-BLACK = (0, 0, 0)
-FONT = cv2.FONT_HERSHEY_SIMPLEX
+GREEN, ORANGE, RED = "#50c850", "#ffa500", "#e62828"
+YELLOW, GRAY, WHITE = "#f0dc00", "#aaaaaa", "#ffffff"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Alarm when your head turns left or right.")
-    p.add_argument("--angle", type=float, default=5.0,
+    p.add_argument("--angle", type=int, default=5,
                    help="alarm when the head is turned more than this many degrees (default 5)")
     p.add_argument("--delay", type=float, default=1.0,
                    help="seconds the head must stay turned before the alarm (default 1.0)")
@@ -62,24 +73,12 @@ def parse_args():
     p.add_argument("--no-top", action="store_true",
                    help="don't keep the window on top of other apps")
     p.add_argument("--opacity", type=float, default=0.5,
-                   help="window opacity from 0.1 (almost invisible) to 1.0 (solid), default 0.5")
+                   help="camera picture opacity from 0.1 (almost see-through) to 1.0 (solid), "
+                        "default 0.5")
     args = p.parse_args()
+    args.angle = min(60, max(2, args.angle))
     args.opacity = min(1.0, max(0.1, round(args.opacity, 1)))
     return args
-
-
-def use_system_fonts():
-    """OpenCV's Linux window comes without fonts, so its tooltips, status bar and
-    Save dialog show no text. Point it to the system fonts (after importing cv2,
-    which sets its own empty font folder)."""
-    if not sys.platform.startswith("linux"):
-        return
-    for folder in ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu-sans-fonts",
-                   "/usr/share/fonts/dejavu", "/usr/share/fonts/TTF",
-                   "/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/ubuntu"):
-        if any(Path(folder).glob("*.ttf")):
-            os.environ["QT_QPA_FONTDIR"] = folder
-            return
 
 
 def ensure_model():
@@ -163,389 +162,360 @@ def open_camera(index):
     return cap
 
 
-def linux_window():
-    """(id, x, y, width, height) of our window from wmctrl, or None."""
-    if not shutil.which("wmctrl"):
-        return None
+def wmctrl_set(states, on):
+    """Linux: add or remove window states ("above", "sticky" = all workspaces) of this
+    app's window. Returns False when wmctrl is missing or the window isn't shown yet."""
+    if not (sys.platform.startswith("linux") and shutil.which("wmctrl")):
+        return False
     try:
-        listing = subprocess.run(["wmctrl", "-l", "-G", "-p"], capture_output=True,
+        listing = subprocess.run(["wmctrl", "-l", "-p"], capture_output=True,
                                  text=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for row in listing.splitlines():
-        parts = row.split(None, 8)  # id, desktop, pid, x, y, width, height, host, title
-        if len(parts) == 9 and parts[2] == str(os.getpid()) and parts[8] == WINDOW:
-            return (parts[0], *map(int, parts[3:7]))
-    return None
-
-
-def set_on_top(on):
-    """Keep the window above other apps and on every workspace. Returns True when
-    done, False when the window isn't ready yet, None when this system can't."""
-    try:  # macOS and Windows
-        cv2.setWindowProperty(WINDOW, cv2.WND_PROP_TOPMOST, 1 if on else 0)
-        if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_TOPMOST) == (1 if on else 0):
-            return True
-    except cv2.error:
-        pass
-    if not shutil.which("wmctrl"):  # Linux: OpenCV's window can't do it by itself
-        return None
-    win = linux_window()
-    if win is None:
-        return False
-    action = "add" if on else "remove"
-    try:
-        subprocess.run(["wmctrl", "-i", "-r", win[0], "-b", f"{action},above,sticky"], timeout=2)
+        ids = [parts[0] for parts in (row.split(None, 4) for row in listing.splitlines())
+               if len(parts) == 5 and parts[2] == str(os.getpid()) and parts[4] == WINDOW]
+        for window_id in ids:
+            subprocess.run(["wmctrl", "-i", "-r", window_id, "-b",
+                            f"{'add' if on else 'remove'},{states}"], timeout=2)
+        return bool(ids)
     except (OSError, subprocess.SubprocessError):
         return False
-    return True
 
 
-def mac_set_opacity(alpha):
-    """Sets alphaValue of our NSWindow through the Objective-C runtime."""
-    import ctypes
-    objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
-    objc.objc_getClass.restype = ctypes.c_void_p
-    objc.objc_getClass.argtypes = [ctypes.c_char_p]
-    objc.sel_registerName.restype = ctypes.c_void_p
-    objc.sel_registerName.argtypes = [ctypes.c_char_p]
-
-    def send(restype, obj, selector, *args):
-        prototype = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p,
-                                     *(type(a) for a in args))
-        return prototype(("objc_msgSend", objc))(obj, objc.sel_registerName(selector), *args)
-
-    app = send(ctypes.c_void_p, objc.objc_getClass(b"NSApplication"), b"sharedApplication")
-    windows = send(ctypes.c_void_p, app, b"windows")
-    for i in range(send(ctypes.c_ulong, windows, b"count")):
-        win = send(ctypes.c_void_p, windows, b"objectAtIndex:", ctypes.c_ulong(i))
-        title = send(ctypes.c_void_p, win, b"title")
-        if title and send(ctypes.c_char_p, title, b"UTF8String") == WINDOW.encode():
-            send(None, win, b"setAlphaValue:", ctypes.c_double(alpha))
-            return True
-    return False
-
-
-def set_opacity(alpha):
-    """Makes the whole window see-through: 1.0 = solid, 0.1 = almost invisible.
-    Returns the same as set_on_top."""
-    if sys.platform == "darwin":
-        try:
-            return mac_set_opacity(alpha)
-        except (OSError, AttributeError):
-            return None
-    if not (shutil.which("wmctrl") and shutil.which("xprop")):
-        return None
-    win = linux_window()
-    if win is None:
-        return False
-    try:  # the window manager reads this property and fades the whole window
-        subprocess.run(["xprop", "-id", win[0], "-f", "_NET_WM_WINDOW_OPACITY", "32c", "-set",
-                        "_NET_WM_WINDOW_OPACITY", str(int(alpha * 0xFFFFFFFF))], timeout=2)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return True
-
-
-class WindowSetting:
-    """Applies a window setting (on top, opacity) once the window exists."""
-
-    def __init__(self, apply, value, initial, hint):
-        self.apply, self.value, self.applied, self.hint = apply, value, initial, hint
-        self.retry = 0.0
-
-    def update(self, now):
-        if self.applied == self.value or now < self.retry:
-            return
-        done = self.apply(self.value)
-        if done is None:  # this system can't do it: say so once and stop trying
-            if self.hint:
-                print(self.hint)
-                self.hint = None
-            self.applied = self.value
-        elif done:
-            self.applied = self.value
-        else:
-            self.retry = now + 0.5  # window not shown yet, try again soon
-
-
-def main_screen():
-    """(x, y, width, height) of the main screen, or None if it can't be found."""
-    try:
-        if sys.platform == "darwin":
-            import ctypes
-
-            class CGRect(ctypes.Structure):
-                _fields_ = [(name, ctypes.c_double) for name in ("x", "y", "w", "h")]
-
-            cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-            cg.CGMainDisplayID.restype = ctypes.c_uint32
-            cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
-            cg.CGDisplayBounds.restype = CGRect
-            r = cg.CGDisplayBounds(cg.CGMainDisplayID())
-            return int(r.x), int(r.y), int(r.w), int(r.h)
-        out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True,
-                             text=True, timeout=2).stdout
-        # Lines like " 0: +*HDMI-1 1920/510x1080/290+0+0  HDMI-1"; * marks the main screen.
-        monitors = re.findall(r"^\s*\d+: \+?(\*?)\S+ (\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", out, re.M)
-        if monitors:
-            _, w, h, x, y = max(monitors, key=lambda m: m[0] == "*")
-            return int(x), int(y), int(w), int(h)
-    except (OSError, AttributeError, subprocess.SubprocessError):
-        pass
-    return None
-
-
-class WindowPlacer:
-    """Sizes the window to the camera picture and puts it in the middle of the screen.
-
-    The window manager shifts the window by its title bar, and OpenCV's Linux
-    toolbar takes room from the picture, so half a second later it measures the
-    real window and corrects both once."""
-
+class FaceTracker:
     def __init__(self):
-        self.screen = main_screen()
-        self.size = None
-        self.asked = None   # position passed to moveWindow
-        self.fix_at = None
+        self.landmarker = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(ensure_model())),
+            running_mode=vision.RunningMode.VIDEO,
+            output_facial_transformation_matrixes=True,
+        ))
+        self.last_ts = 0
 
-    def centered(self, w, h):
-        sx, sy, sw, sh = self.screen
-        return sx + (sw - w) // 2, sy + (sh - h) // 2
+    def head_yaw(self, frame, now):
+        """Head turn in degrees: positive = turned to your left, negative = to your
+        right, None = no face found."""
+        self.last_ts = max(self.last_ts + 1, int(now * 1000))  # mediapipe needs rising timestamps
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.landmarker.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), self.last_ts)
+        if not result.facial_transformation_matrixes:
+            return None
+        m = result.facial_transformation_matrixes[0]
+        return math.degrees(math.atan2(-m[2][0], math.hypot(m[2][1], m[2][2])))
 
-    def update(self, frame, now):
-        if self.size is None:
-            fh, fw = frame.shape[:2]
-            scale = 1.0
-            if self.screen:
-                scale = min(1.0, 0.8 * self.screen[2] / fw, 0.8 * self.screen[3] / fh)
-            self.size = (int(fw * scale), int(fh * scale))
-            cv2.resizeWindow(WINDOW, *self.size)
-            if self.screen:
-                self.asked = self.centered(*self.size)
-                cv2.moveWindow(WINDOW, *self.asked)
-            self.fix_at = now + 0.5
-        elif self.fix_at is not None and now >= self.fix_at:
-            self.fix_at = None
-            win = linux_window()
-            if win is None or self.asked is None:
-                return
-            _, x, y, w, h = win
-            picture_h = cv2.getWindowImageRect(WINDOW)[3]
-            if 0 < picture_h < self.size[1]:  # make room for the toolbar
-                h += self.size[1] - picture_h
-                cv2.resizeWindow(WINDOW, w, h)
-            tx, ty = self.centered(w, h)
-            cv2.moveWindow(WINDOW, self.asked[0] + tx - x, self.asked[1] + ty - y)
+    def close(self):
+        self.landmarker.close()
 
 
-def head_yaw(result):
-    """Head turn in degrees: positive = turned to your left, negative = to your right."""
-    if not result.facial_transformation_matrixes:
-        return None
-    m = result.facial_transformation_matrixes[0]
-    return math.degrees(math.atan2(-m[2][0], math.hypot(m[2][1], m[2][2])))
+class HeadMonitor:
+    """Decides straight / turning / turned, relative to the calibrated straight position."""
 
+    def __init__(self, angle, delay):
+        self.angle, self.delay = angle, delay
+        self.calibrate()
 
-def put_text(img, text, org, scale, color, thickness=2):
-    """Text on a darkened band, so it stays readable on any background."""
-    (tw, th), base = cv2.getTextSize(text, FONT, scale, thickness)
-    x, y = org
-    pad = max(4, th // 3)
-    y1, y2 = max(0, y - th - pad), min(img.shape[0], y + base + pad)
-    x1, x2 = max(0, x - pad), min(img.shape[1], x + tw + pad)
-    img[y1:y2, x1:x2] = (img[y1:y2, x1:x2] * 0.35).astype(img.dtype)
-    cv2.putText(img, text, org, FONT, scale, color, thickness, cv2.LINE_AA)
+    def calibrate(self):
+        self.baseline = None        # head yaw when looking straight at the screen
+        self.samples = []           # (time, yaw) samples while calibrating
+        self.calibrated_at = None
+        self.smooth = None          # smoothed yaw, removes jitter
+        self.last_rel, self.last_seen = None, 0.0
+        self.turned_since = None
 
-
-def opacity_buttons(w):
-    """Boxes of the opacity buttons at the top right: [(value, x1, y1, x2, y2), ...]."""
-    s = w / 640
-    bw, bh, gap = int(40 * s), int(24 * s), int(5 * s)
-    x0 = w - int(24 * s) - len(OPACITIES) * (bw + gap) + gap
-    y1 = int(68 * s)
-    return [(v, x0 + i * (bw + gap), y1, x0 + i * (bw + gap) + bw, y1 + bh)
-            for i, v in enumerate(OPACITIES)]
-
-
-def draw_opacity_buttons(view, opacity):
-    s = view.shape[1] / 640
-    thickness = max(1, int(s))
-    buttons = opacity_buttons(view.shape[1])
-    _, bx, by1, _, by2 = buttons[0]
-    (tw, th), _ = cv2.getTextSize("Opacity", FONT, 0.5 * s, thickness)
-    put_text(view, "Opacity", (bx - tw - int(12 * s), (by1 + by2 + th) // 2), 0.5 * s, WHITE, thickness)
-    for value, x1, y1, x2, y2 in buttons:
-        selected = abs(value - opacity) < 0.05
-        if selected:
-            cv2.rectangle(view, (x1, y1), (x2, y2), WHITE, -1)
+    def update(self, yaw, now):
+        """Returns (status text, color, degrees from straight or None, alarming)."""
+        rel = None
+        if yaw is not None:
+            self.smooth = yaw if self.smooth is None else self.smooth + 0.4 * (yaw - self.smooth)
+            if self.baseline is None:
+                self.samples.append((now, self.smooth))
+                if now - self.samples[0][0] >= CALIBRATION_SECONDS:
+                    values = sorted(v for _, v in self.samples)
+                    self.baseline = values[len(values) // 2]
+                    self.calibrated_at = now
+                    print(f"Calibrated (camera sees your straight head at {self.baseline:+.0f} deg).")
+            if self.baseline is not None:
+                rel = self.smooth - self.baseline
+                self.last_rel, self.last_seen = rel, now
         else:
-            view[y1:y2, x1:x2] = (view[y1:y2, x1:x2] * 0.35).astype(view.dtype)
-            cv2.rectangle(view, (x1, y1), (x2, y2), GRAY, 1)
-        label = f"{value:.1f}"
-        (tw, th), _ = cv2.getTextSize(label, FONT, 0.45 * s, thickness)
-        cv2.putText(view, label, ((x1 + x2 - tw) // 2, (y1 + y2 + th) // 2), FONT, 0.45 * s,
-                    BLACK if selected else WHITE, thickness, cv2.LINE_AA)
+            self.smooth = None
+            self.samples.clear()
+            # Turned so far that the face can't be tracked: treat as still turned.
+            if (self.baseline is not None and self.last_rel is not None
+                    and abs(self.last_rel) >= self.angle
+                    and now - self.last_seen < LOST_FACE_SECONDS):
+                rel = self.last_rel
+
+        hysteresis = min(HYSTERESIS_DEG, self.angle * 0.4)
+        limit = self.angle - hysteresis if self.turned_since is not None else self.angle
+        if rel is not None and abs(rel) >= limit:
+            if self.turned_since is None:
+                self.turned_since = now
+        else:
+            self.turned_since = None
+        alarming = self.turned_since is not None and now - self.turned_since >= self.delay
+
+        if self.baseline is None:
+            status = ("Look straight at the screen - calibrating..." if yaw is not None
+                      else "No face found - calibrating...")
+            return status, YELLOW, None, False
+        if now - self.calibrated_at < 2.0:
+            return "Saved as your straight position", GREEN, rel, alarming
+        if rel is None:
+            return "No face found", GRAY, None, False
+        side = "LEFT" if rel > 0 else "RIGHT"
+        if alarming:
+            return f"HEAD TURNED {side}  {abs(rel):.0f}°", RED, rel, True
+        if self.turned_since is not None:
+            return f"Turning {side.lower()}  {abs(rel):.0f}°", ORANGE, rel, False
+        return f"Straight  {abs(rel):.0f}°", GREEN, rel, False
 
 
-def draw(view, status, color, rel, angle, alarming, sound_on, on_top, opacity):
-    h, w = view.shape[:2]
-    s = w / 640
+class VideoView(QWidget):
+    """The camera picture, see-through by `opacity`, with a solid status line,
+    gauge and red alarm frame on top."""
 
-    if alarming:
-        cv2.rectangle(view, (0, 0), (w - 1, h - 1), RED, int(18 * s))
-    put_text(view, status, (int(20 * s), int(45 * s)), 1.0 * s, color, max(2, int(2 * s)))
+    def __init__(self, opacity, angle):
+        super().__init__()
+        self.opacity, self.zoom, self.angle = opacity, 1.0, angle
+        self.image = None
+        self.status, self.color, self.rel, self.alarming = "Starting the camera...", GRAY, None, False
+        self.setMinimumSize(320, 240)
 
-    # Gauge: the view is mirrored, so turning to your left moves the dot to the left.
-    cx, cy, half = w // 2, h - int(60 * s), int(w * 0.35)
-    cv2.line(view, (cx - half, cy), (cx + half, cy), GRAY, max(2, int(3 * s)))
-    for sign in (-1, 1):
-        x = cx + int(sign * half * angle / GAUGE_RANGE_DEG)
-        cv2.line(view, (x, cy - int(12 * s)), (x, cy + int(12 * s)), ORANGE, max(2, int(3 * s)))
-    cv2.line(view, (cx, cy - int(8 * s)), (cx, cy + int(8 * s)), WHITE, 1)
-    if rel is not None:
-        clipped = max(-GAUGE_RANGE_DEG, min(GAUGE_RANGE_DEG, rel))
-        x = cx - int(half * clipped / GAUGE_RANGE_DEG)
-        cv2.circle(view, (x, cy), int(10 * s), color, -1, cv2.LINE_AA)
+    def show_frame(self, frame, status, color, rel, alarming, angle):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        self.image = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        self.status, self.color, self.rel, self.alarming, self.angle = status, color, rel, alarming, angle
+        self.update()
 
-    help_text = (f"c: calibrate  +/-: angle {angle:.0f}  m: sound {'on' if sound_on else 'OFF'}  "
-                 f"t: on top{'' if on_top else ' OFF'}  q: quit")
-    put_text(view, help_text, (int(20 * s), h - int(18 * s)), 0.5 * s, WHITE, 1)
-    draw_opacity_buttons(view, opacity)
+    def source_rect(self):
+        """Part of the picture to show: fills the view without stretching, cut by the zoom."""
+        iw, ih = self.image.width(), self.image.height()
+        scale = max(self.width() / iw, self.height() / ih) * self.zoom
+        sw, sh = self.width() / scale, self.height() / scale
+        return QRectF((iw - sw) / 2, (ih - sh) / 2, sw, sh)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        view = QRectF(self.rect())
+        if self.image is not None:
+            p.setOpacity(self.opacity)
+            p.drawImage(view, self.image, self.source_rect())
+            p.setOpacity(1.0)
+        s = view.width() / 640
+
+        if self.alarming:
+            p.setPen(QPen(QColor(RED), 14 * s))
+            p.drawRect(view.adjusted(7 * s, 7 * s, -7 * s, -7 * s))
+
+        font = p.font()
+        font.setPixelSize(max(12, int(24 * s)))
+        font.setBold(True)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        band = QRectF(14 * s, 14 * s, metrics.horizontalAdvance(self.status) + 24 * s,
+                      metrics.height() + 12 * s)
+        p.fillRect(band, QColor(0, 0, 0, 170))
+        p.setPen(QColor(self.color))
+        p.drawText(band, Qt.AlignmentFlag.AlignCenter, self.status)
+
+        # Gauge: the picture is mirrored, so turning to your left moves the dot to the left.
+        cx, cy, half = view.width() / 2, view.height() - 34 * s, view.width() * 0.35
+        p.setPen(QPen(QColor(GRAY), 3 * s))
+        p.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+        p.setPen(QPen(QColor(ORANGE), 3 * s))
+        for sign in (-1, 1):
+            x = cx + sign * half * self.angle / GAUGE_RANGE_DEG
+            p.drawLine(QPointF(x, cy - 12 * s), QPointF(x, cy + 12 * s))
+        p.setPen(QPen(QColor(WHITE), 1))
+        p.drawLine(QPointF(cx, cy - 8 * s), QPointF(cx, cy + 8 * s))
+        if self.rel is not None:
+            clipped = max(-GAUGE_RANGE_DEG, min(GAUGE_RANGE_DEG, self.rel))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self.color))
+            p.drawEllipse(QPointF(cx - half * clipped / GAUGE_RANGE_DEG, cy), 10 * s, 10 * s)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, args, cap, tracker, alarm):
+        super().__init__()
+        self.cap, self.tracker, self.alarm = cap, tracker, alarm
+        self.monitor = HeadMonitor(args.angle, args.delay)
+        self.frame = None           # last mirrored camera picture, for Save image
+        self.bad_frames = 0
+
+        self.setWindowTitle(WINDOW)
+        # Lets the picture be see-through while the toolbar stays solid.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.view = VideoView(args.opacity, args.angle)
+        self.setCentralWidget(self.view)
+        self.build_toolbar(args)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, not args.no_top)
+        self.resize(640, 480 + self.toolbar.sizeHint().height())
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(0)
+
+    def add_button(self, text, tip, slot, checked=None, shortcut=None):
+        action = QAction(text, self)
+        action.setToolTip(tip)
+        if shortcut:
+            action.setShortcut(shortcut)
+        if checked is None:
+            action.triggered.connect(slot)
+        else:
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.toggled.connect(slot)
+        self.toolbar.addAction(action)
+        return action
+
+    def build_toolbar(self, args):
+        bar = self.toolbar = QToolBar()
+        bar.setMovable(False)
+        bar.setAutoFillBackground(True)  # solid, even when the picture is see-through
+        self.addToolBar(bar)
+
+        self.add_button("Calibrate", "Look straight at the screen, then click (key c)",
+                        self.monitor.calibrate)
+        bar.addSeparator()
+        bar.addWidget(QLabel(" Angle "))
+        self.angle_box = QSpinBox()
+        self.angle_box.setRange(2, 60)
+        self.angle_box.setSuffix("°")
+        self.angle_box.setValue(args.angle)
+        self.angle_box.setToolTip("Alarm when the head turns more than this (keys + and -)")
+        self.angle_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # keep keys for the window
+        self.angle_box.valueChanged.connect(lambda value: setattr(self.monitor, "angle", value))
+        bar.addWidget(self.angle_box)
+        bar.addSeparator()
+        self.sound_action = self.add_button("Sound", "Beep on / off (key m)",
+                                            lambda on: setattr(self.alarm, "enabled", on),
+                                            checked=not args.mute)
+        self.top_action = self.add_button("On top", "Keep this window over other apps (key t)",
+                                          self.set_on_top, checked=not args.no_top)
+        bar.addSeparator()
+        bar.addWidget(QLabel(" Opacity "))
+        self.opacity_box = QComboBox()
+        self.opacity_box.addItems([f"{value:.1f}" for value in OPACITIES])
+        self.opacity_box.setCurrentIndex(OPACITIES.index(args.opacity))
+        self.opacity_box.setToolTip("How see-through the camera picture is, 1.0 = solid (keys 1-9, 0)")
+        self.opacity_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.opacity_box.currentIndexChanged.connect(self.set_opacity)
+        bar.addWidget(self.opacity_box)
+        bar.addSeparator()
+        self.add_button("Zoom in", "Zoom in (Ctrl +)", lambda: self.set_zoom(1.25),
+                        shortcut=QKeySequence.StandardKey.ZoomIn)
+        self.add_button("Zoom out", "Zoom out (Ctrl -)", lambda: self.set_zoom(1 / 1.25),
+                        shortcut=QKeySequence.StandardKey.ZoomOut)
+        self.add_button("Save image", "Save the current camera picture (Ctrl S)", self.save_image,
+                        shortcut=QKeySequence.StandardKey.Save)
+
+    def set_opacity(self, index):
+        self.view.opacity = OPACITIES[index]
+        self.view.update()
+
+    def set_zoom(self, factor):
+        self.view.zoom = min(MAX_ZOOM, max(1.0, self.view.zoom * factor))
+        self.view.update()
+
+    def set_on_top(self, on):
+        # On Linux wmctrl changes it in place (and all workspaces too); Qt would
+        # have to re-create the window.
+        if not wmctrl_set("above,sticky", on):
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+            self.show()  # changing window flags hides the window
+
+    def show_on_all_workspaces(self, tries=10):
+        """Linux: keep the window on every workspace, once it is on screen."""
+        if (not wmctrl_set("sticky", True) and tries > 1
+                and sys.platform.startswith("linux") and shutil.which("wmctrl")):
+            QTimer.singleShot(300, lambda: self.show_on_all_workspaces(tries - 1))
+
+    def center_on_screen(self):
+        frame = self.frameGeometry()
+        frame.moveCenter(self.screen().availableGeometry().center())
+        self.move(frame.topLeft())
+
+    def save_image(self):
+        if self.frame is None:
+            return
+        frame = self.frame.copy()  # the picture at the moment of the click
+        pictures = Path.home() / "Pictures"
+        folder = pictures if pictures.is_dir() else Path.home()
+        default = folder / time.strftime("head-turn-%Y%m%d-%H%M%S.png")
+        path, _ = QFileDialog.getSaveFileName(self, "Save image", str(default),
+                                              "Images (*.png *.jpg)")
+        if not path:
+            return
+        if Path(path).suffix.lower() not in (".png", ".jpg", ".jpeg"):
+            path += ".png"
+        if not cv2.imwrite(path, frame):
+            print(f"Could not save {path}")
+
+    def keyPressEvent(self, event):
+        key = event.text().lower()
+        if key == "q" or event.key() == Qt.Key.Key_Escape:
+            self.close()
+        elif key == "c":
+            self.monitor.calibrate()
+        elif key in ("+", "="):
+            self.angle_box.stepUp()
+        elif key in ("-", "_"):
+            self.angle_box.stepDown()
+        elif key == "m":
+            self.sound_action.toggle()
+        elif key == "t":
+            self.top_action.toggle()
+        elif len(key) == 1 and key.isdigit():
+            self.opacity_box.setCurrentIndex(int(key) - 1 if key != "0" else 9)
+        else:
+            super().keyPressEvent(event)
+
+    def tick(self):
+        ok, frame = self.cap.read()
+        if not ok:
+            self.bad_frames += 1
+            if self.bad_frames > 50:
+                print("The camera stopped sending pictures.")
+                self.close()
+            time.sleep(0.05)
+            return
+        self.bad_frames = 0
+
+        now = time.monotonic()
+        status, color, rel, alarming = self.monitor.update(self.tracker.head_yaw(frame, now), now)
+        if alarming:
+            self.alarm.ring(now)
+        self.frame = cv2.flip(frame, 1)  # mirror, like a video call self-view
+        self.view.show_frame(self.frame, status, color, rel, alarming, self.monitor.angle)
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        self.cap.release()
+        self.tracker.close()
+        super().closeEvent(event)
 
 
 def main():
     args = parse_args()
-    landmarker = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(ensure_model())),
-        running_mode=vision.RunningMode.VIDEO,
-        output_facial_transformation_matrixes=True,
-    ))
+    tracker = FaceTracker()
     alarm = Alarm(enabled=not args.mute)
     cap = open_camera(args.camera)
-    use_system_fonts()
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    placer = WindowPlacer()
-    on_top = WindowSetting(set_on_top, not args.no_top, False,
-                           "Can't keep the window on top here. On Linux install wmctrl "
-                           "(sudo apt install wmctrl), or right-click the window title "
-                           "and choose 'Always on Top'.")
-    opacity = WindowSetting(set_opacity, args.opacity, 1.0,
-                            "Can't make the window see-through here. On Linux install "
-                            "wmctrl and xprop (sudo apt install wmctrl x11-utils).")
-    clicks = []
-    cv2.setMouseCallback(WINDOW, lambda event, x, y, flags, param:
-                         clicks.append((x, y)) if event == cv2.EVENT_LBUTTONDOWN else None)
 
-    angle = args.angle
-    baseline = None             # head yaw when looking straight at the screen
-    calibration = []            # (time, yaw) samples while calibrating
-    smooth = None               # smoothed yaw, removes jitter
-    last_rel, last_seen = None, 0.0
-    turned_since = None
-    calibrated_at = None
-    last_ts = 0
-    bad_frames = 0
+    signal.signal(signal.SIGINT, signal.SIG_DFL)  # Ctrl+C in the terminal quits
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName(WINDOW)
+    window = MainWindow(args, cap, tracker, alarm)
+    window.show()
+    QTimer.singleShot(150, window.center_on_screen)  # once the window frame size is known
+    if not args.no_top:
+        window.show_on_all_workspaces()
 
     print("Look straight at the screen for 2 seconds to calibrate. Press q in the window to quit.")
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            bad_frames += 1
-            if bad_frames > 50:
-                sys.exit("The camera stopped sending pictures.")
-            time.sleep(0.05)
-            continue
-        bad_frames = 0
-
-        now = time.monotonic()
-        last_ts = max(last_ts + 1, int(now * 1000))  # mediapipe needs rising timestamps
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        yaw = head_yaw(landmarker.detect_for_video(
-            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), last_ts))
-
-        rel = None
-        if yaw is not None:
-            smooth = yaw if smooth is None else smooth + 0.4 * (yaw - smooth)
-            if baseline is None:
-                calibration.append((now, smooth))
-                if now - calibration[0][0] >= CALIBRATION_SECONDS:
-                    values = sorted(v for _, v in calibration)
-                    baseline = values[len(values) // 2]
-                    calibrated_at = now
-                    print(f"Calibrated (camera sees your straight head at {baseline:+.0f} deg).")
-            if baseline is not None:
-                rel = smooth - baseline
-                last_rel, last_seen = rel, now
-        else:
-            smooth = None
-            calibration.clear()
-            # Turned so far that the face can't be tracked: treat as still turned.
-            if (baseline is not None and last_rel is not None and abs(last_rel) >= angle
-                    and now - last_seen < LOST_FACE_SECONDS):
-                rel = last_rel
-
-        hysteresis = min(HYSTERESIS_DEG, angle * 0.4)
-        limit = angle - hysteresis if turned_since is not None else angle
-        if rel is not None and abs(rel) >= limit:
-            if turned_since is None:
-                turned_since = now
-        else:
-            turned_since = None
-        alarming = turned_since is not None and now - turned_since >= args.delay
-        if alarming:
-            alarm.ring(now)
-
-        if baseline is None:
-            status, color = ("Look straight at the screen - calibrating..." if yaw is not None
-                             else "No face found - calibrating..."), YELLOW
-        elif now - calibrated_at < 2.0:
-            status, color = "Saved as your straight position", GREEN
-        elif rel is None:
-            status, color = "No face found", GRAY
-        else:
-            side = "LEFT" if rel > 0 else "RIGHT"
-            if alarming:
-                status, color = f"HEAD TURNED {side}  {abs(rel):.0f} deg", RED
-            elif turned_since is not None:
-                status, color = f"Turning {side.lower()}  {abs(rel):.0f} deg", ORANGE
-            else:
-                status, color = f"Straight  {abs(rel):.0f} deg", GREEN
-
-        view = cv2.flip(frame, 1)  # mirror, like a video call self-view
-        draw(view, status, color, rel, angle, alarming, alarm.enabled, on_top.value, opacity.value)
-        cv2.imshow(WINDOW, view)
-        placer.update(view, now)
-        on_top.update(now)
-        opacity.update(now)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27) or cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
-            break
-        for x, y in clicks:
-            for value, x1, y1, x2, y2 in opacity_buttons(view.shape[1]):
-                if x1 <= x <= x2 and y1 <= y <= y2:
-                    opacity.value = value
-        clicks.clear()
-        if key == ord("c"):
-            baseline, last_rel, turned_since = None, None, None
-            calibration.clear()
-        elif key in (ord("+"), ord("=")):
-            angle = min(60.0, angle + 1)
-        elif key in (ord("-"), ord("_")):
-            angle = max(2.0, angle - 1)
-        elif key == ord("m"):
-            alarm.enabled = not alarm.enabled
-        elif key == ord("t"):
-            on_top.value = not on_top.value
-        elif ord("1") <= key <= ord("9"):
-            opacity.value = (key - ord("0")) / 10
-        elif key == ord("0"):
-            opacity.value = 1.0
-
-    cap.release()
-    cv2.destroyAllWindows()
-    landmarker.close()
+    app.exec()
 
 
 if __name__ == "__main__":

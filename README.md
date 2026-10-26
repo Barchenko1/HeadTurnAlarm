@@ -22,15 +22,18 @@ On macOS, allow camera access for your terminal app when asked.
    gets a red frame and it beeps until you turn back.
 3. The window opens in the middle of the screen and stays on top of other apps
    (on Linux also on every workspace), so you can see it while you work.
-4. The window is half see-through (opacity 0.5). Click the buttons 0.1 ... 1.0 at the
-   top of the window to change it (1.0 = solid).
+4. The camera picture is half see-through (opacity 0.5), the toolbar stays solid.
+   Change it with **Opacity** in the toolbar (0.1 ... 1.0, 1.0 = solid).
+
+The toolbar has every control: **Calibrate**, **Angle**, **Sound**, **On top**,
+**Opacity**, **Zoom in**, **Zoom out** and **Save image**. Hover over a button to see its key.
 
 How it knows "straight": it doesn't know where your camera is. It finds your face,
 measures which way your head points (it follows your nose and face shape, not your
 eyes), and saves the direction you were facing during those first 2 seconds.
 So if you weren't looking straight at the screen then, look straight and press `c`.
 
-Keys (click the video window first):
+Keys (click the window first):
 
 | Key     | What it does                                  |
 |---------|-----------------------------------------------|
@@ -39,6 +42,8 @@ Keys (click the video window first):
 | `m`     | sound on / off                                |
 | `t`     | keep the window on top of other apps on / off |
 | `1`-`9` | opacity 0.1 - 0.9 (`0` = 1.0, solid)          |
+| Ctrl `+` `-` | zoom in / out (Cmd on macOS)             |
+| Ctrl `S` | save the camera picture (Cmd on macOS)       |
 | `q`     | quit                                          |
 
 Options:
@@ -58,9 +63,6 @@ Options:
 
 - Linux: usually only one app can use the camera at a time, so close video calls first.
   On macOS the camera can be shared.
-- Linux: keeping the window on top, centering it and opacity use `wmctrl` and `xprop`
-  (`sudo apt install wmctrl x11-utils`).
-  Without it, right-click the window title and choose "Always on Top".
-- macOS: works the same way, except the window shows only on the current desktop (Space)
-  and has no toolbar with the Save button.
+- Linux: showing the window on every workspace uses `wmctrl` (`sudo apt install wmctrl`).
+- macOS: works the same way, except the window shows only on the current desktop (Space).
 - Intel Macs need Python 3.12 or older (newer Python has no face library for Intel Macs yet).
